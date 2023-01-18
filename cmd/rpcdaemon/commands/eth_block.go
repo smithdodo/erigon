@@ -446,7 +446,7 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		jsonResult["coinbaseDiff"] = "0"
 		// jsonResult["gasFees"] = gasFeesTx.String()
 		// jsonResult["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiffTx, gasFeesTx).String()
-		// jsonResult["gasPrice"] = new(big.Int).Div(coinbaseDiffTx, big.NewInt(int64(receipt.GasUsed))).String()
+		jsonResult["gasPrice"] = tx.GetPrice().String()
 		results = append(results, jsonResult)
 
 	}
