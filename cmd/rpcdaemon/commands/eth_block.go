@@ -2,10 +2,12 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/hexutility"
 	"github.com/ledgerwatch/erigon-lib/kv"
@@ -26,7 +28,7 @@ import (
 	"github.com/ledgerwatch/erigon/turbo/transactions"
 )
 
-func (api *APIImpl) CallBundle(ctx context.Context, txHashes []libcommon.Hash, stateBlockNumberOrHash rpc.BlockNumberOrHash, timeoutMilliSecondsPtr *int64) (map[string]interface{}, error) {
+func (api *APIImpl) CallBundleErigon(ctx context.Context, txHashes []libcommon.Hash, stateBlockNumberOrHash rpc.BlockNumberOrHash, timeoutMilliSecondsPtr *int64) (map[string]interface{}, error) {
 	tx, err := api.db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
@@ -193,6 +195,279 @@ func (api *APIImpl) CallBundle(ctx context.Context, txHashes []libcommon.Hash, s
 	ret["bundleHash"] = hexutility.Encode(bundleHash.Sum(nil))
 	return ret, nil
 }
+
+// ===================Flashbots CallBundle========================
+// CallBundleArgs represents the arguments for a call.
+type CallBundleArgs struct {
+	Txs                    []hexutil.Bytes       `json:"txs"`
+	BlockNumber            rpc.BlockNumber       `json:"blockNumber"`
+	StateBlockNumberOrHash rpc.BlockNumberOrHash `json:"stateBlockNumber"`
+	Coinbase               *string               `json:"coinbase"`
+	Timestamp              *uint64               `json:"timestamp"`
+	Timeout                *int64                `json:"timeout"`
+	GasLimit               *uint64               `json:"gasLimit"`
+	Difficulty             *big.Int              `json:"difficulty"`
+	BaseFee                *big.Int              `json:"baseFee"`
+}
+
+// CallBundle will simulate a bundle of transactions at the top of a given block
+// number with the state of another (or the same) block. This can be used to
+// simulate future blocks with the current state, or it can be used to simulate
+// a past block.
+// The sender is responsible for signing the transactions and using the correct
+// nonce and ensuring validity
+func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[string]interface{}, error) {
+	// simulator := miner.GetTxSimulator()
+	if len(args.Txs) == 0 {
+		return nil, errors.New("bundle missing txs")
+	}
+	if args.BlockNumber == 0 {
+		return nil, errors.New("bundle missing blockNumber")
+	}
+
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	chainConfig, err := api.chainConfig(tx)
+	if err != nil {
+		return nil, err
+	}
+	engine := api.engine()
+
+	var txs types.Transactions
+	for _, encodedTx := range args.Txs {
+		tx, err := types.UnmarshalTransactionFromBinary(encodedTx)
+		if err != nil {
+			return nil, err
+		}
+		txs = append(txs, tx)
+	}
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	// timeoutMilliSeconds := int64(5000)
+	// if args.Timeout != nil {
+	// 	timeoutMilliSeconds = *args.Timeout
+	// }
+	// timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+	// start := time.Now()
+
+	stateBlockNumber, hash, latest, err := rpchelper.GetBlockNumber(args.StateBlockNumberOrHash, tx, api.filters)
+	if err != nil {
+		return nil, err
+	}
+	var stateReader state.StateReader
+	if latest {
+		cacheView, err := api.stateCache.View(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		stateReader = state.NewCachedReader2(cacheView, tx)
+	} else {
+		stateReader, err = rpchelper.CreateHistoryStateReader(tx, stateBlockNumber, 0, api._agg, api.historyV3(tx), chainConfig.ChainName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ibs := state.New(stateReader)
+
+	parent := rawdb.ReadHeader(tx, hash, stateBlockNumber)
+	if parent == nil {
+		return nil, fmt.Errorf("block %d(%x) not found", stateBlockNumber, hash)
+	}
+
+	// var state *state.StateDB
+	// var parent *types.Header
+	// state, err = GetTxSimulator().GetPendingState()
+	// if err == nil {
+	// 	parent, err = s.b.HeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	// } else {
+	// 	log.Warn("Failed to get pending state from simulator")
+	// 	// return nil, errors.New("state not found in simulator state cache")
+	// 	state, parent, err = s.b.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	// 	if err != nil {
+	// 		return nil, errors.New("callBundle failed to get state and parent header")
+	// 	}
+	// }
+
+	// state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	// log.Info("Callbundle state fetch", "duration", time.Since(start).String())
+	// if state == nil || err != nil {
+	// 	return nil, err
+	// }
+	blockNumber := big.NewInt(int64(args.BlockNumber))
+
+	timestamp := parent.Time + 1
+	if args.Timestamp != nil {
+		timestamp = *args.Timestamp
+	}
+	coinbase := parent.Coinbase
+	if args.Coinbase != nil {
+		coinbase = libcommon.HexToAddress(*args.Coinbase)
+	}
+	difficulty := parent.Difficulty
+	if args.Difficulty != nil {
+		difficulty = args.Difficulty
+	}
+	gasLimit := parent.GasLimit
+	if args.GasLimit != nil {
+		gasLimit = *args.GasLimit
+	}
+	// var baseFee *big.Int
+	// if args.BaseFee != nil {
+	// 	baseFee = args.BaseFee
+	// }
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   gasLimit,
+		Time:       timestamp,
+		Difficulty: difficulty,
+		Coinbase:   coinbase,
+		// BaseFee:    baseFee,
+	}
+	signer := types.MakeSigner(chainConfig, stateBlockNumber)
+	rules := chainConfig.Rules(stateBlockNumber, timestamp)
+	firstMsg, err := txs[0].AsMessage(*signer, nil, rules)
+	if err != nil {
+		return nil, err
+	}
+
+	blockCtx := transactions.NewEVMBlockContext(engine, header, args.StateBlockNumberOrHash.RequireCanonical, tx, api._blockReader)
+	txCtx := core.NewEVMTxContext(firstMsg)
+	// Get a new instance of the EVM
+	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: false})
+
+	timeoutMilliSeconds := int64(5000)
+	// if timeoutMilliSecondsPtr != nil {
+	// 	timeoutMilliSeconds = *timeoutMilliSecondsPtr
+	// }
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	// Setup the gas pool (also for unmetered requests)
+	// and apply the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+
+	results := []map[string]interface{}{}
+
+	bundleHash := cryptopool.NewLegacyKeccak256()
+	defer cryptopool.ReturnToPoolKeccak256(bundleHash)
+
+	var totalGasUsed uint64
+	// gasFees := new(big.Int)
+	for _, tx := range txs {
+		// txstart := time.Now()
+
+		msg, err := tx.AsMessage(*signer, nil, rules)
+		if err != nil {
+			return nil, err
+		}
+		// Execute the transaction message
+		result, err := core.ApplyMessage(evm, msg, gp, true /* refunds */, false /* gasBailout */)
+		if err != nil {
+			return nil, err
+		}
+		// If the timer caused an abort, return an appropriate error message
+		if evm.Cancelled() {
+			return nil, fmt.Errorf("execution aborted (timeout = %v)", timeout)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("callBundle err: %w; txhash %s", err, tx.Hash())
+		}
+
+		txHash := tx.Hash().String()
+		from, ok := tx.GetSender()
+		if !ok {
+			log.Info("callBundle err get sender; txhash %s", tx.Hash())
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+		}
+		to := "0x"
+		if tx.GetTo() != nil {
+			to = tx.GetTo().String()
+		}
+		jsonResult := map[string]interface{}{
+			"txHash": txHash,
+			// "gasUsed":     receipt.GasUsed,
+			"gasUsed":     result.UsedGas,
+			"fromAddress": from.String(),
+			"toAddress":   to,
+		}
+		totalGasUsed += result.UsedGas
+
+		bundleHash.Write(tx.Hash().Bytes())
+		if result.Err != nil {
+			jsonResult["error"] = result.Err.Error()
+			revert := result.Revert()
+			if len(revert) > 0 {
+				jsonResult["revert"] = string(revert)
+				log.Debug("callBundle tx revert", "tx", tx.Hash().Hex(), "reason", jsonResult["revert"])
+			}
+		} else {
+			// dst := make([]byte, hex.EncodedLen(len(result.Return())))
+			// hex.Encode(dst, result.Return())
+			// jsonResult["value"] = "0x" + string(dst)
+			// jsonResult["value"] = "0x" + string(dst)
+			jsonResult["value"] = libcommon.BytesToHash(result.Return())
+		}
+
+		// coinbaseDiffTx := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBeforeTx)
+		// coinbaseDiffTx := big.NewInt(0)
+		jsonResult["coinbaseDiff"] = "0"
+		// jsonResult["gasFees"] = gasFeesTx.String()
+		// jsonResult["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiffTx, gasFeesTx).String()
+		// jsonResult["gasPrice"] = new(big.Int).Div(coinbaseDiffTx, big.NewInt(int64(receipt.GasUsed))).String()
+		results = append(results, jsonResult)
+
+	}
+
+	ret := map[string]interface{}{}
+	ret["results"] = results
+	coinbaseDiff := big.NewInt(0)
+	ret["coinbaseDiff"] = coinbaseDiff.String()
+	// ret["gasFees"] = gasFees.String()
+	// ret["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiff, gasFees).String()
+	ret["bundleGasPrice"] = new(big.Int).Div(coinbaseDiff, big.NewInt(int64(totalGasUsed))).String()
+	ret["totalGasUsed"] = totalGasUsed
+	ret["stateBlockNumber"] = parent.Number.Int64()
+
+	ret["bundleHash"] = "0x" + common.Bytes2Hex(bundleHash.Sum(nil))
+
+	// log.Info("callbundle done", "duration", time.Since(start), "timestamp", time.Now().UnixNano()/1000000)
+	return ret, nil
+}
+
+// ===============================================================
 
 // GetBlockByNumber implements eth_getBlockByNumber. Returns information about a block given the block's number.
 func (api *APIImpl) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
