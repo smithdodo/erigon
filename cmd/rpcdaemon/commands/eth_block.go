@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -438,7 +439,10 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 			// hex.Encode(dst, result.Return())
 			// jsonResult["value"] = "0x" + string(dst)
 			// jsonResult["value"] = "0x" + string(dst)
-			jsonResult["value"] = libcommon.BytesToHash(result.Return())
+			// jsonResult["value"] = result.Return()
+			dst := make([]byte, hex.EncodedLen(len(result.Return())))
+			hex.Encode(dst, result.Return())
+			jsonResult["value"] = "0x" + string(dst)
 		}
 
 		// coinbaseDiffTx := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBeforeTx)
