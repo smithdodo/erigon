@@ -267,7 +267,7 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		}
 		stateReader = state.NewCachedReader2(cacheView, tx)
 	} else {
-		stateReader, err = rpchelper.CreateHistoryStateReader(tx, stateBlockNumber, 0, api._agg, api.historyV3(tx), chainConfig.ChainName)
+		stateReader, err = rpchelper.CreateHistoryStateReader(tx, stateBlockNumber, 0, api.historyV3(tx), chainConfig.ChainName)
 		if err != nil {
 			return nil, err
 		}
@@ -405,9 +405,9 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		}
 
 		txHash := tx.Hash().String()
-		from, ok := tx.GetSender()
-		if !ok {
-			log.Info("callBundle err get sender; txhash %s", tx.Hash())
+		from, err := signer.Sender(tx)
+		if err != nil {
+			log.Info("callBundle err get sender")
 		}
 
 		if err != nil {
@@ -435,21 +435,14 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 				log.Debug("callBundle tx revert", "tx", tx.Hash().Hex(), "reason", jsonResult["revert"])
 			}
 		} else {
-			// dst := make([]byte, hex.EncodedLen(len(result.Return())))
-			// hex.Encode(dst, result.Return())
-			// jsonResult["value"] = "0x" + string(dst)
-			// jsonResult["value"] = "0x" + string(dst)
-			// jsonResult["value"] = result.Return()
 			dst := make([]byte, hex.EncodedLen(len(result.Return())))
 			hex.Encode(dst, result.Return())
 			jsonResult["value"] = "0x" + string(dst)
 		}
 
-		// coinbaseDiffTx := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBeforeTx)
-		// coinbaseDiffTx := big.NewInt(0)
 		jsonResult["coinbaseDiff"] = "0"
-		// jsonResult["gasFees"] = gasFeesTx.String()
-		// jsonResult["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiffTx, gasFeesTx).String()
+		jsonResult["gasFees"] = "0"
+		jsonResult["ethSentToCoinbase"] = "0"
 		jsonResult["gasPrice"] = tx.GetPrice().String()
 		results = append(results, jsonResult)
 
@@ -459,8 +452,8 @@ func (api *APIImpl) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 	ret["results"] = results
 	coinbaseDiff := big.NewInt(0)
 	ret["coinbaseDiff"] = coinbaseDiff.String()
-	// ret["gasFees"] = gasFees.String()
-	// ret["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiff, gasFees).String()
+	ret["gasFees"] = "0"
+	ret["ethSentToCoinbase"] = "0"
 	ret["bundleGasPrice"] = new(big.Int).Div(coinbaseDiff, big.NewInt(int64(totalGasUsed))).String()
 	ret["totalGasUsed"] = totalGasUsed
 	ret["stateBlockNumber"] = parent.Number.Int64()
